@@ -1,0 +1,24 @@
+dataset: kvasir
+root: data/Kvasir-SEG
+split_file: splits/kvasir/seed0_5.json
+
+family: segformer
+encoder: mit_b2
+num_classes: 1
+pretrained: true
+model_kwargs: {}
+
+image_size: 384
+batch_size: 8
+workers: 4
+
+lr: 3.0e-4
+wd: 5.0e-4
+
+max_steps: 20000
+eval_every_steps: 500
+patience: 10
+min_delta: 0.001
+
+out_dir: runs/kvasir_segformer
+gpus: 1

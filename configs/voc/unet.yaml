@@ -1,0 +1,25 @@
+dataset: voc
+root: data
+split_file: splits/voc/seed0_5.json
+
+family: unet
+encoder: resnet34
+num_classes: 21
+pretrained: true
+model_kwargs: {}
+
+image_size: 512
+batch_size: 8
+workers: 4
+
+lr: 3.0e-4
+wd: 1.0e-4
+
+max_steps: 80000
+eval_every_steps: 1000
+patience: 12
+min_delta: 0.002
+monitor: val/miou
+
+out_dir: runs/voc_unet
+gpus: 1

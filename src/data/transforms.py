@@ -3,30 +3,27 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 
-def make_transforms(task: str, image_size: int):
-    """
-    Build train/val Albumentations pipelines.
+def _rrc(image_size: int, scale=(0.7, 1.0), ratio=(0.9, 1.1)):
+    try:
+        return A.RandomResizedCrop(size=(image_size, image_size), scale=scale, ratio=ratio)
+    except TypeError:
+        return A.RandomResizedCrop(height=image_size, width=image_size, scale=scale, ratio=ratio)
 
-    Args:
-        task: one of {"medical", "scene", "parts"}
-        image_size: final square size (crop/pad)
-    Returns:
-        (train_transform, val_transform)
-    """
+
+def make_transforms(task: str, image_size: int):
     task = task.lower()
+    image_size = int(image_size)
 
     if task == "medical":
-        # Moderate spatial + light blur; preserve structure
         train = A.Compose([
-            A.RandomResizedCrop(image_size, image_size, scale=(0.7, 1.3), ratio=(0.9, 1.1)),
+            _rrc(image_size, scale=(0.7, 1.0), ratio=(0.9, 1.1)),
             A.HorizontalFlip(p=0.5),
-            A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.10, rotate_limit=10, border_mode=0, p=0.5),
+            A.Affine(scale=(0.9, 1.1), translate_percent={"x": 0.05, "y": 0.05}, rotate=(-10, 10), p=0.5),
             A.GaussianBlur(blur_limit=(3, 5), p=0.2),
             A.Normalize(),
             ToTensorV2(),
         ])
     elif task in {"scene", "parts"}:
-        # VOC / Parts style: resize, pad, then random crop to image_size
         train = A.Compose([
             A.LongestMaxSize(max_size=int(image_size * 1.2)),
             A.PadIfNeeded(image_size, image_size, border_mode=0),
@@ -45,5 +42,4 @@ def make_transforms(task: str, image_size: int):
         A.Normalize(),
         ToTensorV2(),
     ])
-
     return train, val

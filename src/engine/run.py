@@ -2,17 +2,17 @@ from __future__ import annotations
 import os, yaml, time, json
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Dict, List
 import torch
 
 from src.data.transforms import make_transforms
-from src.data.kvasir import KvasirSeg  # keeps working for Kvasir flat folders
+from src.data.kvasir import KvasirSeg
 from src.data.voc import VOCSeg, IGNORE_INDEX as VOC_IGNORE
 from src.data.pascal_parts import PascalParts
 from src.data.splits import load_ids
 from src.models.smp_wrapper import SMPWrapper
 from src.engine.lit_module import LitSeg
-from src.data.folder_seg import FolderSeg  # NEW: generic images/masks loader
+from src.data.folder_seg import FolderSeg  # generic flat images/masks loader
 
 
 def _set_seed(seed: int):
@@ -31,13 +31,7 @@ def _dataloader(ds, batch_size: int, workers: int, shuffle: bool) -> DataLoader:
 
 class _RunStatsCallback(pl.callbacks.Callback):
     """
-    Logs run-level stats:
-      - params
-      - simple latency_ms for a single forward (approx)
-      - steps_to_best / epochs_to_best / wall_to_best_s / images_to_best
-      - wall_clock_s
-      - metric_per_1k_steps / metric_per_epoch / metric_per_sec
-    Works with CSV/TensorBoard loggers.
+    Logs run-level stats for efficiency analysis.
     """
     def __init__(self, monitor: str, mode: str, img_size: int, batch_size: int):
         super().__init__()
@@ -100,7 +94,6 @@ class _RunStatsCallback(pl.callbacks.Callback):
         epochs_to_best = float(self._best_epoch if self._best_epoch is not None else -1)
         wall_to_best = float(self._best_wall_s if self._best_wall_s is not None else float("nan"))
 
-        # Derived efficiency features (guard divisions)
         best_metric = float(self._best) if self._best is not None else float("nan")
         denom_steps = max(steps_to_best, 1)
         denom_epochs = max(epochs_to_best, 1e-6)
@@ -131,29 +124,32 @@ def _flat_layout_exists(root: str) -> bool:
     return os.path.isdir(os.path.join(root, "images")) and os.path.isdir(os.path.join(root, "masks"))
 
 
-def _load_manifest(path: str) -> Dict[str, List[str]]:
+def _read_ids_or_manifest(path: str) -> Dict[str, List[str]] | List[str]:
     """
-    Manifest JSON format:
-    {
-      "train": ["id1","id2",...],
-      "val":   ["id3",...],
-      "test":  ["id4",...]
-    }
+    Try to read a manifest (dict with train/val/test) first; if it's a plain list, return list.
+    Falls back to load_ids() for legacy JSON arrays.
     """
-    with open(path) as f:
-        js = json.load(f)
-    for k in ("train", "val", "test"):
-        js.setdefault(k, [])
-    return js
+    with open(path, "r") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        # normalize keys
+        return {
+            "train": list(data.get("train", [])),
+            "val": list(data.get("val", [])),
+            "test": list(data.get("test", [])),
+        }
+    if isinstance(data, list):
+        return list(data)
+    # last resort
+    return load_ids(path)
 
 
 def make_datasets(cfg):
     """
-    Supports 3 modes:
-      1) `split_manifest`: use explicit train/val/test lists (flat images/masks preferred).
-      2) `split_file`: list of ids; we do a deterministic 90/10 split for train/val (Kvasir) or restrict train ids (VOC/Parts).
-      3) No split specified: use defaults (Kvasir 90/10 on all; VOC/Parts official lists).
-    Also auto-detects "flat" layout (root/{images,masks}) for VOC/Parts; otherwise uses official VOC/Parts structures.
+    Modes:
+      - split_manifest: use explicit train/val/test ids (preferred).
+      - split_file: can be EITHER a plain list (legacy) OR a manifest dict; both handled.
+      - else: defaults (Kvasir 90/10; VOC/Parts official lists).
     """
     ds = cfg["dataset"].lower()
     root = cfg["root"]
@@ -170,100 +166,130 @@ def make_datasets(cfg):
     else:
         raise ValueError(f"Unknown dataset: {ds}")
 
-    # Determine loader class & ignore index per dataset/layout
     is_flat = _flat_layout_exists(root)
+
     if ds == "kvasir":
-        loader_cls = KvasirSeg  # already flat-images/masks aware
-        ignore = None
-        task = "binary"
+        loader_cls = KvasirSeg
+        task, ignore = "binary", None
     elif ds == "voc":
         loader_cls = FolderSeg if is_flat else VOCSeg
-        ignore = VOC_IGNORE
-        task = "multiclass"
-    elif ds == "parts":
+        task, ignore = "multiclass", VOC_IGNORE
+    else:  # parts
         loader_cls = FolderSeg if is_flat else PascalParts
-        ignore = int(cfg.get("ignore_index", 255))
-        task = "multiclass"
+        task, ignore = "multiclass", int(cfg.get("ignore_index", 255))
 
-    # Build datasets
+    # ---------- Preferred: split_manifest ----------
     if cfg.get("split_manifest"):
-        # ------------- Manifest mode (preferred for your 80/10/10 per budget) -------------
-        man = _load_manifest(cfg["split_manifest"])
-        train_ids, val_ids = man["train"], man["val"]
-        # For flat layout, we can directly use generic loaders; for official VOC/Parts use their classes
+        man = _read_ids_or_manifest(cfg["split_manifest"])
+        if isinstance(man, list):
+            # If someone accidentally points a list here, make a 90/10 split for train/val.
+            ids = man
+            g = torch.Generator().manual_seed(seed)
+            perm = torch.randperm(len(ids), generator=g).tolist()
+            n_val = max(1, int(0.1 * len(ids)))
+            train_ids = [ids[i] for i in perm[:-n_val]] if len(ids) > 1 else ids
+            val_ids   = [ids[i] for i in perm[-n_val:]] if len(ids) > 1 else ids
+        else:
+            train_ids, val_ids = man["train"], man["val"]
+
         if loader_cls in (FolderSeg, KvasirSeg):
             tr = loader_cls(root, train_ids, transform=train_tf)
             va = loader_cls(root, val_ids,   transform=val_tf)
         else:
-            # Official structures (VOC/Parts) ignore provided val list (we can filter train)
-            # For fairness, filter train to train_ids; val remains the official val split.
             if ds == "voc":
                 tr = VOCSeg(root, "train", ids_subset=train_ids, transform=train_tf)
                 va = VOCSeg(root, "val", transform=val_tf)
-            else:  # parts (PascalParts)
+            else:
                 tr = PascalParts(root, "train", transform=train_tf, ignore_index=ignore)
-                # filter train ids
                 tr.ids = [i for i in tr.ids if i in set(train_ids)]
                 va = PascalParts(root, "val", transform=val_tf, ignore_index=ignore)
         return tr, va, task, ignore
 
-    # ------------- Legacy modes (split_file or default) -------------
+    # ---------- Legacy / flexible: split_file ----------
+    if cfg.get("split_file"):
+        sp = _read_ids_or_manifest(cfg["split_file"])
+        if ds == "kvasir":
+            # If it's a manifest dict, use it directly; else do seeded 90/10 on the list.
+            if isinstance(sp, dict):
+                train_ids, val_ids = sp.get("train", []), sp.get("val", [])
+                if loader_cls is KvasirSeg:
+                    tr = KvasirSeg(root, train_ids, transform=train_tf)
+                    va = KvasirSeg(root, val_ids,   transform=val_tf)
+                else:
+                    tr = loader_cls(root, train_ids, transform=train_tf)
+                    va = loader_cls(root, val_ids,   transform=val_tf)
+                return tr, va, task, ignore
+            else:
+                ids = sp  # list
+                g = torch.Generator().manual_seed(seed)
+                perm = torch.randperm(len(ids), generator=g).tolist()
+                n_val = max(1, int(0.1 * len(ids)))
+                train_ids = [ids[i] for i in perm[:-n_val]] if len(ids) > 1 else ids
+                val_ids   = [ids[i] for i in perm[-n_val:]] if len(ids) > 1 else ids
+                tr = KvasirSeg(root, train_ids, transform=train_tf)
+                va = KvasirSeg(root, val_ids,   transform=val_tf)
+                return tr, va, task, ignore
+
+        elif ds in ("voc", "parts"):
+            # Restrict train to ids in list or manifest; val depends on layout
+            if isinstance(sp, dict):
+                train_ids, val_ids = sp.get("train", []), sp.get("val", [])
+            else:
+                train_ids, val_ids = sp, None
+
+            if is_flat:
+                tr = FolderSeg(root, train_ids, transform=train_tf)
+                if val_ids is None:
+                    # simple fallback val: take 10% of the provided train ids
+                    n_val = max(1, int(0.1 * len(train_ids))) if len(train_ids) > 1 else len(train_ids)
+                    val_ids = train_ids[-n_val:]
+                va = FolderSeg(root, val_ids, transform=val_tf)
+            else:
+                if ds == "voc":
+                    tr = VOCSeg(root, "train", ids_subset=train_ids, transform=train_tf)
+                    va = VOCSeg(root, "val", transform=val_tf)
+                else:
+                    tr = PascalParts(root, "train", transform=train_tf, ignore_index=ignore)
+                    tr.ids = [i for i in tr.ids if i in set(train_ids)]
+                    va = PascalParts(root, "val", transform=val_tf, ignore_index=ignore)
+            return tr, va, task, ignore
+
+    # ---------- Defaults ----------
     if ds == "kvasir":
-        # split_file: list of ids -> do seeded 90/10 train/val
-        if cfg.get("split_file"):
-            ids = load_ids(cfg["split_file"])
-        else:
-            names = sorted(os.listdir(os.path.join(root, "images")))
-            ids = [os.path.splitext(i)[0] for i in names]
+        names = sorted(os.listdir(os.path.join(root, "images")))
+        ids = [os.path.splitext(i)[0] for i in names]
         g = torch.Generator().manual_seed(seed)
         perm = torch.randperm(len(ids), generator=g).tolist()
         n_val = max(1, int(0.1 * len(ids)))
         train_ids = [ids[i] for i in perm[:-n_val]] if len(ids) > 1 else ids
         val_ids   = [ids[i] for i in perm[-n_val:]] if len(ids) > 1 else ids
-        tr = loader_cls(root, train_ids, transform=train_tf)
-        va = loader_cls(root, val_ids,   transform=val_tf)
+        tr = KvasirSeg(root, train_ids, transform=train_tf)
+        va = KvasirSeg(root, val_ids,   transform=val_tf)
         return tr, va, task, ignore
 
     elif ds == "voc":
         if is_flat:
-            # flat images/masks + optional split_file to restrict train
-            if cfg.get("split_file"):
-                train_ids = load_ids(cfg["split_file"])
-            else:
-                names = sorted(os.listdir(os.path.join(root, "images")))
-                train_ids = [os.path.splitext(i)[0] for i in names]
-            tr = FolderSeg(root, train_ids, transform=train_tf)
-            # Val: if you have a val manifest, prefer using manifest mode above; otherwise take 10% of all ids as val
-            # (to preserve old behavior, we use official val only when in official layout)
-            val_ids = train_ids[-max(1, int(0.1 * len(train_ids))):] if len(train_ids) > 1 else train_ids
-            va = FolderSeg(root, val_ids, transform=val_tf)
+            names = sorted(os.listdir(os.path.join(root, "images")))
+            ids = [os.path.splitext(i)[0] for i in names]
+            n_val = max(1, int(0.1 * len(ids))) if len(ids) > 1 else len(ids)
+            tr = FolderSeg(root, ids[:-n_val], transform=train_tf)
+            va = FolderSeg(root, ids[-n_val:], transform=val_tf)
         else:
-            tr = VOCSeg(root, "train",
-                        ids_subset=load_ids(cfg["split_file"]) if cfg.get("split_file") else None,
-                        transform=train_tf)
+            tr = VOCSeg(root, "train", transform=train_tf)
             va = VOCSeg(root, "val", transform=val_tf)
         return tr, va, task, ignore
 
-    elif ds == "parts":
+    else:  # parts
         if is_flat:
-            if cfg.get("split_file"):
-                train_ids = load_ids(cfg["split_file"])
-            else:
-                names = sorted(os.listdir(os.path.join(root, "images")))
-                train_ids = [os.path.splitext(i)[0] for i in names]
-            tr = FolderSeg(root, train_ids, transform=train_tf)
-            val_ids = train_ids[-max(1, int(0.1 * len(train_ids))):] if len(train_ids) > 1 else train_ids
-            va = FolderSeg(root, val_ids, transform=val_tf)
+            names = sorted(os.listdir(os.path.join(root, "images")))
+            ids = [os.path.splitext(i)[0] for i in names]
+            n_val = max(1, int(0.1 * len(ids))) if len(ids) > 1 else len(ids)
+            tr = FolderSeg(root, ids[:-n_val], transform=train_tf)
+            va = FolderSeg(root, ids[-n_val:], transform=val_tf)
         else:
             tr = PascalParts(root, "train", transform=train_tf, ignore_index=ignore)
-            if cfg.get("split_file"):
-                # restrict training ids
-                keep = set(load_ids(cfg["split_file"]))
-                tr.ids = [i for i in tr.ids if i in keep]
             va = PascalParts(root, "val", transform=val_tf, ignore_index=ignore)
         return tr, va, task, ignore
-
-    raise ValueError(f"Dataset builder fell through for: {ds}")
 
 
 def main(cfg_path: str):
@@ -303,7 +329,7 @@ def main(cfg_path: str):
     if monitor is None:
         monitor = "val/dice" if cfg["num_classes"] == 1 else "val/miou"
 
-    # Checkpoints (top-k + last) to a stable directory
+    # Checkpoints (top-k + last)
     ckpt_dir = os.path.join(out_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
     callbacks = [
@@ -321,7 +347,7 @@ def main(cfg_path: str):
         _RunStatsCallback(monitor=monitor, mode="max", img_size=int(cfg["image_size"]), batch_size=int(cfg["batch_size"])),
     ]
 
-    # Train-to-convergence (if train_to_convergence: true OR max_steps<=0)
+    # Train-to-convergence toggle
     train_to_convergence = bool(cfg.get("train_to_convergence", False))
     cfg_max_steps = int(cfg.get("max_steps", 0))
     use_convergence = train_to_convergence or (cfg_max_steps <= 0)
@@ -359,7 +385,6 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=None, help="Override seed without editing YAML")
     args = p.parse_args()
     if args.seed is not None:
-        # Lightweight override of seed for this invocation
         cfg = yaml.safe_load(open(args.cfg))
         cfg["seed"] = int(args.seed)
         tmp = ".run_override_seed.yaml"

@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 import torchmetrics as tm
+from torchmetrics.segmentation import DiceScore
 
 
 def dice_loss_with_logits(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -33,24 +34,34 @@ class LitSeg(pl.LightningModule):
         self.save_hyperparameters(ignore=["net"])
         self.net = net
         self.task = task
-        # torchmetrics wants -100 for "no ignore" in CE; keep None -> -100 internally
+        # torchmetrics CE uses -100 for "no ignore"; map None -> -100 internally
         self.ignore_index = -100 if ignore_index is None else int(ignore_index)
+        self.num_classes = int(num_classes)
 
         if task == "binary":
             self.loss_bce = nn.BCEWithLogitsLoss()
-            # Dice metric for binary segmentation; thresholds preds internally at 0.5
-            self.metric = tm.Dice(task="binary")
+            # Foreground-only Dice over the whole epoch; we'll pass 0/1 label indices.
+            self.val_metric = DiceScore(
+                num_classes=2,
+                include_background=False,
+                average="macro",
+            )
+            self.monitor_name = "val/dice"
         else:
             self.loss_ce = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
-            self.metric = tm.JaccardIndex(
+            # mIoU (Jaccard) over the whole epoch with ignore_index
+            self.val_metric = tm.JaccardIndex(
                 task="multiclass",
-                num_classes=num_classes,
+                num_classes=self.num_classes,
                 ignore_index=self.ignore_index,
+                average="macro",
             )
+            self.monitor_name = "val/miou"
 
     def forward(self, x):  # type: ignore
         return self.net(x)
 
+    # ----------------------------- Training -----------------------------
     def training_step(self, batch, _):
         x, y = batch  # y: [B,H,W] (int64)
         logits = self(x)
@@ -72,22 +83,35 @@ class LitSeg(pl.LightningModule):
                 self.log("lr", lr, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
         return loss
 
+    # ----------------------------- Validation -----------------------------
+    def on_validation_epoch_start(self):
+        # Ensure epoch-level accumulation
+        self.val_metric.reset()
+
     def validation_step(self, batch, _):
         x, y = batch  # y: [B,H,W] (int64)
         logits = self(x)
-        if self.task == "binary":
-            # Provide probabilities to the Dice metric; it applies threshold=0.5
-            preds = torch.sigmoid(logits).squeeze(1)  # [B,H,W]
-            val = self.metric(preds, y.int())
-            self.log("val/dice", val, prog_bar=True, sync_dist=True)
-        else:
-            # JaccardIndex handles logits directly for multiclass
-            val = self.metric(logits, y)
-            self.log("val/miou", val, prog_bar=True, sync_dist=True)
 
+        if self.task == "binary":
+            # Threshold predictions at 0.5 → indices {0,1}
+            preds = (torch.sigmoid(logits) > 0.5).long().squeeze(1)  # [B,H,W]
+            self.val_metric.update(preds, y)
+        else:
+            # Convert to class indices and update IoU
+            preds = logits.argmax(dim=1)  # [B,H,W]
+            self.val_metric.update(preds, y)
+
+    def on_validation_epoch_end(self):
+        val_value = float(self.val_metric.compute().item())
+        if self.task == "binary":
+            self.log("val/dice", val_value, prog_bar=True, sync_dist=True)
+        else:
+            self.log("val/miou", val_value, prog_bar=True, sync_dist=True)
+
+    # ----------------------------- Optimizer & LR -----------------------------
     def configure_optimizers(self):
         opt = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.wd)
-        # Trainer may not be attached at construction time; use safe fallback
+        # Trainer may not be attached at construction; use safe fallback
         tmax = getattr(self.trainer, "max_steps", 1000) or 1000
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=tmax)
         return {"optimizer": opt, "lr_scheduler": {"scheduler": sch, "interval": "step"}}

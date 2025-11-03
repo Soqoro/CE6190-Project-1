@@ -1,17 +1,18 @@
 from __future__ import annotations
-import os, yaml, time
+import os, yaml, time, json
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
-from typing import Optional
+from typing import Optional, Tuple, List, Dict
 import torch
 
 from src.data.transforms import make_transforms
-from src.data.kvasir import KvasirSeg
+from src.data.kvasir import KvasirSeg  # keeps working for Kvasir flat folders
 from src.data.voc import VOCSeg, IGNORE_INDEX as VOC_IGNORE
 from src.data.pascal_parts import PascalParts
 from src.data.splits import load_ids
 from src.models.smp_wrapper import SMPWrapper
 from src.engine.lit_module import LitSeg
+from src.data.folder_seg import FolderSeg  # NEW: generic images/masks loader
 
 
 def _set_seed(seed: int):
@@ -33,18 +34,22 @@ class _RunStatsCallback(pl.callbacks.Callback):
     Logs run-level stats:
       - params
       - simple latency_ms for a single forward (approx)
-      - steps_to_best for the monitored metric
+      - steps_to_best / epochs_to_best / wall_to_best_s / images_to_best
       - wall_clock_s
+      - metric_per_1k_steps / metric_per_epoch / metric_per_sec
     Works with CSV/TensorBoard loggers.
     """
-    def __init__(self, monitor: str, mode: str, img_size: int):
+    def __init__(self, monitor: str, mode: str, img_size: int, batch_size: int):
         super().__init__()
         self.monitor = monitor
         self.mode = mode
         self.img_size = int(img_size)
+        self.batch_size = int(batch_size)
         self._t0: Optional[float] = None
         self._best = None
         self._best_step = None
+        self._best_epoch = None
+        self._best_wall_s = None
 
     def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         self._t0 = time.time()
@@ -80,64 +85,185 @@ class _RunStatsCallback(pl.callbacks.Callback):
             step = trainer.global_step
             if self._best is None:
                 self._best, self._best_step = cur, step
+                self._best_epoch = trainer.current_epoch
+                self._best_wall_s = (time.time() - (self._t0 or time.time()))
             else:
                 better = (cur > self._best) if self.mode == "max" else (cur < self._best)
                 if better:
                     self._best, self._best_step = cur, step
+                    self._best_epoch = trainer.current_epoch
+                    self._best_wall_s = (time.time() - (self._t0 or time.time()))
 
     def on_fit_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         elapsed = time.time() - (self._t0 or time.time())
+        steps_to_best = int(self._best_step or -1)
+        epochs_to_best = float(self._best_epoch if self._best_epoch is not None else -1)
+        wall_to_best = float(self._best_wall_s if self._best_wall_s is not None else float("nan"))
+
+        # Derived efficiency features (guard divisions)
+        best_metric = float(self._best) if self._best is not None else float("nan")
+        denom_steps = max(steps_to_best, 1)
+        denom_epochs = max(epochs_to_best, 1e-6)
+        denom_secs = max(wall_to_best, 1e-6)
+
+        metric_per_1k_steps = best_metric / (denom_steps / 1000.0)
+        metric_per_epoch = best_metric / denom_epochs
+        metric_per_sec = best_metric / denom_secs
+
+        images_to_best = steps_to_best * max(self.batch_size, 1)
+
         trainer.logger.log_metrics(
-            {"wall_clock_s": float(elapsed), "steps_to_best": int(self._best_step or -1)},
+            {
+                "wall_clock_s": float(elapsed),
+                "steps_to_best": steps_to_best,
+                "epochs_to_best": epochs_to_best,
+                "wall_to_best_s": wall_to_best,
+                "images_to_best": int(images_to_best),
+                "metric_per_1k_steps": float(metric_per_1k_steps),
+                "metric_per_epoch": float(metric_per_epoch),
+                "metric_per_sec": float(metric_per_sec),
+            },
             step=trainer.global_step,
         )
 
 
-def make_datasets(cfg):
-    ds = cfg["dataset"].lower()
+def _flat_layout_exists(root: str) -> bool:
+    return os.path.isdir(os.path.join(root, "images")) and os.path.isdir(os.path.join(root, "masks"))
 
+
+def _load_manifest(path: str) -> Dict[str, List[str]]:
+    """
+    Manifest JSON format:
+    {
+      "train": ["id1","id2",...],
+      "val":   ["id3",...],
+      "test":  ["id4",...]
+    }
+    """
+    with open(path) as f:
+        js = json.load(f)
+    for k in ("train", "val", "test"):
+        js.setdefault(k, [])
+    return js
+
+
+def make_datasets(cfg):
+    """
+    Supports 3 modes:
+      1) `split_manifest`: use explicit train/val/test lists (flat images/masks preferred).
+      2) `split_file`: list of ids; we do a deterministic 90/10 split for train/val (Kvasir) or restrict train ids (VOC/Parts).
+      3) No split specified: use defaults (Kvasir 90/10 on all; VOC/Parts official lists).
+    Also auto-detects "flat" layout (root/{images,masks}) for VOC/Parts; otherwise uses official VOC/Parts structures.
+    """
+    ds = cfg["dataset"].lower()
+    root = cfg["root"]
+    img_size = int(cfg["image_size"])
+    seed = int(cfg.get("seed", 0))
+
+    # Pick transforms
     if ds == "kvasir":
-        train_tf, val_tf = make_transforms("medical", int(cfg["image_size"]))
-        # Expect split_file like splits/kvasir/seed0_5.json (list of ids)
+        train_tf, val_tf = make_transforms("medical", img_size)
+    elif ds == "voc":
+        train_tf, val_tf = make_transforms("scene", img_size)
+    elif ds == "parts":
+        train_tf, val_tf = make_transforms("parts", img_size)
+    else:
+        raise ValueError(f"Unknown dataset: {ds}")
+
+    # Determine loader class & ignore index per dataset/layout
+    is_flat = _flat_layout_exists(root)
+    if ds == "kvasir":
+        loader_cls = KvasirSeg  # already flat-images/masks aware
+        ignore = None
+        task = "binary"
+    elif ds == "voc":
+        loader_cls = FolderSeg if is_flat else VOCSeg
+        ignore = VOC_IGNORE
+        task = "multiclass"
+    elif ds == "parts":
+        loader_cls = FolderSeg if is_flat else PascalParts
+        ignore = int(cfg.get("ignore_index", 255))
+        task = "multiclass"
+
+    # Build datasets
+    if cfg.get("split_manifest"):
+        # ------------- Manifest mode (preferred for your 80/10/10 per budget) -------------
+        man = _load_manifest(cfg["split_manifest"])
+        train_ids, val_ids = man["train"], man["val"]
+        # For flat layout, we can directly use generic loaders; for official VOC/Parts use their classes
+        if loader_cls in (FolderSeg, KvasirSeg):
+            tr = loader_cls(root, train_ids, transform=train_tf)
+            va = loader_cls(root, val_ids,   transform=val_tf)
+        else:
+            # Official structures (VOC/Parts) ignore provided val list (we can filter train)
+            # For fairness, filter train to train_ids; val remains the official val split.
+            if ds == "voc":
+                tr = VOCSeg(root, "train", ids_subset=train_ids, transform=train_tf)
+                va = VOCSeg(root, "val", transform=val_tf)
+            else:  # parts (PascalParts)
+                tr = PascalParts(root, "train", transform=train_tf, ignore_index=ignore)
+                # filter train ids
+                tr.ids = [i for i in tr.ids if i in set(train_ids)]
+                va = PascalParts(root, "val", transform=val_tf, ignore_index=ignore)
+        return tr, va, task, ignore
+
+    # ------------- Legacy modes (split_file or default) -------------
+    if ds == "kvasir":
+        # split_file: list of ids -> do seeded 90/10 train/val
         if cfg.get("split_file"):
             ids = load_ids(cfg["split_file"])
         else:
-            names = sorted(os.listdir(os.path.join(cfg["root"], "images")))
+            names = sorted(os.listdir(os.path.join(root, "images")))
             ids = [os.path.splitext(i)[0] for i in names]
-        # split into 90/10 using seed for reproducibility
-        seed = int(cfg.get("seed", 0))
         g = torch.Generator().manual_seed(seed)
         perm = torch.randperm(len(ids), generator=g).tolist()
         n_val = max(1, int(0.1 * len(ids)))
         train_ids = [ids[i] for i in perm[:-n_val]] if len(ids) > 1 else ids
         val_ids   = [ids[i] for i in perm[-n_val:]] if len(ids) > 1 else ids
-        tr = KvasirSeg(cfg["root"], train_ids, transform=train_tf)
-        va = KvasirSeg(cfg["root"], val_ids,   transform=val_tf)
-        task = "binary"
-        ignore = None
+        tr = loader_cls(root, train_ids, transform=train_tf)
+        va = loader_cls(root, val_ids,   transform=val_tf)
+        return tr, va, task, ignore
 
     elif ds == "voc":
-        train_tf, val_tf = make_transforms("scene", int(cfg["image_size"]))
-        tr = VOCSeg(cfg["root"], "train",
-                    ids_subset=load_ids(cfg["split_file"]) if cfg.get("split_file") else None,
-                    transform=train_tf)
-        va = VOCSeg(cfg["root"], "val", transform=val_tf)
-        task = "multiclass"
-        ignore = VOC_IGNORE
+        if is_flat:
+            # flat images/masks + optional split_file to restrict train
+            if cfg.get("split_file"):
+                train_ids = load_ids(cfg["split_file"])
+            else:
+                names = sorted(os.listdir(os.path.join(root, "images")))
+                train_ids = [os.path.splitext(i)[0] for i in names]
+            tr = FolderSeg(root, train_ids, transform=train_tf)
+            # Val: if you have a val manifest, prefer using manifest mode above; otherwise take 10% of all ids as val
+            # (to preserve old behavior, we use official val only when in official layout)
+            val_ids = train_ids[-max(1, int(0.1 * len(train_ids))):] if len(train_ids) > 1 else train_ids
+            va = FolderSeg(root, val_ids, transform=val_tf)
+        else:
+            tr = VOCSeg(root, "train",
+                        ids_subset=load_ids(cfg["split_file"]) if cfg.get("split_file") else None,
+                        transform=train_tf)
+            va = VOCSeg(root, "val", transform=val_tf)
+        return tr, va, task, ignore
 
     elif ds == "parts":
-        train_tf, val_tf = make_transforms("parts", int(cfg["image_size"]))
-        tr = PascalParts(cfg["root"], "train", transform=train_tf,
-                         ignore_index=cfg.get("ignore_index", 255))
-        va = PascalParts(cfg["root"], "val", transform=val_tf,
-                         ignore_index=cfg.get("ignore_index", 255))
-        task = "multiclass"
-        ignore = cfg.get("ignore_index", 255)
+        if is_flat:
+            if cfg.get("split_file"):
+                train_ids = load_ids(cfg["split_file"])
+            else:
+                names = sorted(os.listdir(os.path.join(root, "images")))
+                train_ids = [os.path.splitext(i)[0] for i in names]
+            tr = FolderSeg(root, train_ids, transform=train_tf)
+            val_ids = train_ids[-max(1, int(0.1 * len(train_ids))):] if len(train_ids) > 1 else train_ids
+            va = FolderSeg(root, val_ids, transform=val_tf)
+        else:
+            tr = PascalParts(root, "train", transform=train_tf, ignore_index=ignore)
+            if cfg.get("split_file"):
+                # restrict training ids
+                keep = set(load_ids(cfg["split_file"]))
+                tr.ids = [i for i in tr.ids if i in keep]
+            va = PascalParts(root, "val", transform=val_tf, ignore_index=ignore)
+        return tr, va, task, ignore
 
-    else:
-        raise ValueError(f"Unknown dataset: {ds}")
-
-    return tr, va, task, ignore
+    raise ValueError(f"Dataset builder fell through for: {ds}")
 
 
 def main(cfg_path: str):
@@ -192,11 +318,15 @@ def main(cfg_path: str):
         pl.callbacks.EarlyStopping(monitor=monitor, mode="max",
                                    patience=int(cfg["patience"]), min_delta=float(cfg["min_delta"])),
         pl.callbacks.LearningRateMonitor(logging_interval="step"),
-        _RunStatsCallback(monitor=monitor, mode="max", img_size=int(cfg["image_size"])),
+        _RunStatsCallback(monitor=monitor, mode="max", img_size=int(cfg["image_size"]), batch_size=int(cfg["batch_size"])),
     ]
 
-    trainer = pl.Trainer(
-        max_steps=int(cfg["max_steps"]),
+    # Train-to-convergence (if train_to_convergence: true OR max_steps<=0)
+    train_to_convergence = bool(cfg.get("train_to_convergence", False))
+    cfg_max_steps = int(cfg.get("max_steps", 0))
+    use_convergence = train_to_convergence or (cfg_max_steps <= 0)
+
+    trainer_kwargs = dict(
         val_check_interval=int(cfg["eval_every_steps"]),
         log_every_n_steps=50,
         precision="16-mixed",
@@ -208,6 +338,14 @@ def main(cfg_path: str):
         deterministic=True,
         logger=logger,
     )
+    if use_convergence:
+        trainer_kwargs["max_epochs"] = int(cfg.get("max_epochs", 1000))
+        trainer_kwargs["max_steps"] = None
+    else:
+        trainer_kwargs["max_steps"] = int(cfg["max_steps"])
+
+    trainer = pl.Trainer(**trainer_kwargs)
+
     # Auto-resume from last.ckpt if present
     last_ckpt = os.path.join(ckpt_dir, "last.ckpt")
     ckpt_path = last_ckpt if os.path.exists(last_ckpt) else None

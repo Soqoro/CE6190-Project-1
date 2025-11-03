@@ -8,23 +8,19 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-Data Preparation:
+Prepare Datasets in the following structure:
 
 ```bash
-# Split Kvasir Dataset 80/10/10 using symlinks
-python scripts/split_kvasir_dirs.py \
-  --src data/kvasir \
-  --out data/kvasir_split \
-  --train 0.8 --val 0.1 --test 0.1 \
-  --seed 0 --mode symlink --write_json
+data/
+  voc/     {images,masks}
+  kvasir/  {images,masks}
+  parts/   {images,masks}
 ```
 
-Make splits once:
+Make the dataset splits (80% train/10% val/10% test) for all datasets with 2 budgets (20%, 100%):
 
 ```bash
-python scripts/make_kvasir_splits.py
-python scripts/make_voc_splits.py
-python scripts/make_parts_splits.py
+python scripts/dataset_split.py --data_root data --seed 0
 ```
 
 Kvasir (binary; monitors val/dice):

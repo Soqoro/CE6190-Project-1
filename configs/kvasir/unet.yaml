@@ -1,6 +1,6 @@
 dataset: kvasir
-root: data/Kvasir-SEG
-split_file: splits/kvasir/seed0_5.json  # change to seedX_Y.json as needed
+root: data/kvasir
+split_file: splits/kvasir/seed0_20.json  # change to seedX_Y.json as needed
 
 family: unet
 encoder: resnet34

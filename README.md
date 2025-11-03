@@ -8,6 +8,17 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
+Data Preparation:
+
+```bash
+# Split Kvasir Dataset 80/10/10 using symlinks
+python scripts/split_kvasir_dirs.py \
+  --src data/kvasir \
+  --out data/kvasir_split \
+  --train 0.8 --val 0.1 --test 0.1 \
+  --seed 0 --mode symlink --write_json
+```
+
 Make splits once:
 
 ```bash

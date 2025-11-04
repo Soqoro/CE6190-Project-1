@@ -27,7 +27,6 @@ def collect_ids(root: Path) -> List[str]:
         if not (p.is_file() and p.suffix.lower() in IMG_EXTS):
             continue
         stem = p.stem
-        # find any mask with the same stem and allowed extension
         has_mask = any((msk_dir / f"{stem}{ext}").exists() for ext in MSK_EXTS)
         if has_mask:
             stems.append(stem)
@@ -62,14 +61,15 @@ def split_80_10_10(ids: List[str], seed: int) -> Dict[str, List[str]]:
 
 def main():
     ap = argparse.ArgumentParser(
-        "Make two-level (20% & 100%) 80/10/10 splits for voc/kvasir/parts "
-        "from flat folders: data/<ds>/{images,masks}"
+        "Make two-level (20% & 100%) splits for voc/kvasir/parts from flat folders: data/<ds>/{images,masks}. "
+        "The 100% level uses an 80/10/10 split. The 20% level reuses the SAME val/test as the 100% level and "
+        "subsamples only the train set to low_pct of the FULL-TRAIN pool."
     )
     ap.add_argument("--data_root", default="data",
                     help="Folder that contains voc/, kvasir/, parts/ subfolders")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--low_pct", type=float, default=20.0,
-                    help="LOW budget percent (default 20%% of available pairs)")
+                    help="LOW budget percent of the FULL-TRAIN pool (default 20%%)")
     ap.add_argument("--datasets", nargs="+", default=["voc", "kvasir", "parts"],
                     help="Which dataset subfolders to process")
     ap.add_argument("--out_root", default="splits",
@@ -93,15 +93,25 @@ def main():
             # Either missing images/masks or no valid pairs; skip gracefully
             continue
 
-        n_all = len(ids_all)
-        k_low = max(1, int(round(n_all * args.low_pct / 100.0)))
+        # ---- FULL 80/10/10 from ALL pairs (shared val/test) ----
+        full_split = split_80_10_10(sorted(ids_all), seed=args.seed)
+
+        # ---- LOW budget: sample ONLY from FULL-TRAIN, reuse FULL val/test ----
+        full_train = full_split["train"]
         rng = random.Random(args.seed)
-        low_ids = sorted(rng.sample(ids_all, k_low)) if k_low < n_all else sorted(ids_all)
-        full_ids = sorted(ids_all)
+        k_low_train = max(1, int(round(len(full_train) * args.low_pct / 100.0)))
+        if k_low_train >= len(full_train):
+            low_train = sorted(full_train)
+        else:
+            low_train = sorted(rng.sample(full_train, k_low_train))
 
-        low_split  = split_80_10_10(low_ids, seed=args.seed)
-        full_split = split_80_10_10(full_ids, seed=args.seed)
+        low_split = {
+            "train": low_train,
+            "val":   full_split["val"],   # same validation as FULL
+            "test":  full_split["test"],  # same test as FULL
+        }
 
+        # ---- Save ----
         ds_out = out_root / ds
         ds_out.mkdir(parents=True, exist_ok=True)
 
@@ -112,11 +122,14 @@ def main():
         with open(full_path, "w") as f:
             json.dump(full_split, f)
 
+        # ---- Report ----
+        n_all = len(ids_all)
         print(f"[{ds}] total pairs: {n_all}")
-        print(f"  -> {low_path}  (LOW {args.low_pct:.1f}%: {len(low_ids)} ids) "
-              f"[train {len(low_split['train'])}, val {len(low_split['val'])}, test {len(low_split['test'])}]")
-        print(f"  -> {full_path} (FULL 100%: {len(full_ids)} ids) "
-              f"[train {len(full_split['train'])}, val {len(full_split['val'])}, test {len(full_split['test'])}]")
+        print(f"  FULL (100%)  -> {full_path}")
+        print(f"     train={len(full_split['train'])}, val={len(full_split['val'])}, test={len(full_split['test'])}")
+        print(f"  LOW  ({args.low_pct:.1f}% of FULL-TRAIN) -> {low_path}")
+        print(f"     train={len(low_split['train'])} (subset of FULL-TRAIN), "
+              f"val={len(low_split['val'])} (shared), test={len(low_split['test'])} (shared)")
         processed_any = True
 
     if not processed_any:

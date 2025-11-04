@@ -21,5 +21,5 @@ patience: 10
 min_delta: 0.001
 # monitor auto-set: val/dice for binary
 
-out_dir: runs/kvasir_unet
+out_dir: runs/kvasir_unet # Change when split_file is changed
 gpus: 1

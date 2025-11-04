@@ -5,6 +5,12 @@ from torch.utils.data import DataLoader
 from typing import Optional, Dict, List
 import torch
 
+# Better Tensor Core utilization on Ampere+ and silences TF32 warnings
+try:
+    torch.set_float32_matmul_precision("high")  # or "medium" if you prefer
+except Exception:
+    pass
+
 from src.data.transforms import make_transforms
 from src.data.kvasir import KvasirSeg
 from src.data.voc import VOCSeg, IGNORE_INDEX as VOC_IGNORE
@@ -352,8 +358,15 @@ def main(cfg_path: str):
     cfg_max_steps = int(cfg.get("max_steps", 0))
     use_convergence = train_to_convergence or (cfg_max_steps <= 0)
 
+    # ---- NEW: derive a safe validation interval ----
+    n_train_batches = len(train_loader)
+    eval_every_cfg = int(cfg.get("eval_every_steps", 0))
+    if eval_every_cfg > 0 and n_train_batches > 0:
+        val_check_interval_safe = min(eval_every_cfg, n_train_batches)
+    else:
+        val_check_interval_safe = None  # fall back to epoch-based validation
+
     trainer_kwargs = dict(
-        val_check_interval=int(cfg["eval_every_steps"]),
         log_every_n_steps=50,
         precision="16-mixed",
         gradient_clip_val=1.0,
@@ -369,6 +382,15 @@ def main(cfg_path: str):
         trainer_kwargs["max_steps"] = None
     else:
         trainer_kwargs["max_steps"] = int(cfg["max_steps"])
+
+    # Apply validation cadence (either steps-capped or epoch-based)
+    if val_check_interval_safe is not None:
+        trainer_kwargs["val_check_interval"] = val_check_interval_safe
+        if val_check_interval_safe != eval_every_cfg:
+            print(f"[INFO] Capped val_check_interval from {eval_every_cfg} to {val_check_interval_safe} "
+                  f"(train batches={n_train_batches}).")
+    else:
+        trainer_kwargs["check_val_every_n_epoch"] = 1  # validate once per epoch
 
     trainer = pl.Trainer(**trainer_kwargs)
 

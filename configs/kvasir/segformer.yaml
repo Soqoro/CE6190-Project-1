@@ -1,6 +1,6 @@
 dataset: kvasir
-root: data/Kvasir-SEG
-split_file: splits/kvasir/seed0_5.json
+root: data/kvasir
+split_file: splits/kvasir/seed0_20.json
 
 family: segformer
 encoder: mit_b2
@@ -20,5 +20,5 @@ eval_every_steps: 500
 patience: 10
 min_delta: 0.001
 
-out_dir: runs/kvasir_segformer
+out_dir: runs/kvasir_segformer_20
 gpus: 1

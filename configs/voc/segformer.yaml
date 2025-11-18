@@ -1,6 +1,6 @@
 dataset: voc
-root: data
-split_file: splits/voc/seed0_5.json
+root: data/voc
+split_file: splits/voc/seed0_100.json
 
 family: segformer
 encoder: mit_b2
@@ -21,5 +21,5 @@ patience: 12
 min_delta: 0.002
 monitor: val/miou
 
-out_dir: runs/voc_segformer
+out_dir: runs/voc_segformer_100
 gpus: 1

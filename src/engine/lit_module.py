@@ -5,113 +5,78 @@ import pytorch_lightning as pl
 import torchmetrics as tm
 from torchmetrics.segmentation import DiceScore
 
-
-def dice_loss_with_logits(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Soft Dice loss for binary segmentation given logits and 0/1 targets [B,1,H,W]."""
-    probs = torch.sigmoid(logits)
-    num = 2 * (probs * targets).sum(dim=(1, 2, 3)) + eps
-    den = (probs.pow(2) + targets.pow(2)).sum(dim=(1, 2, 3)) + eps
-    return 1.0 - (num / den).mean()
-
-
 class LitSeg(pl.LightningModule):
-    """Lightning training/eval for segmentation with SMP backbone.
-
-    - Binary: BCEWithLogits + Dice (monitor `val/dice`)
-    - Multiclass: CrossEntropy + mIoU (monitor `val/miou`)
-    - Fixed `max_steps` is set at Trainer-level for fair compute.
-    """
-    def __init__(
-        self,
-        net: nn.Module,
-        task: str,
-        num_classes: int,
-        lr: float = 3e-4,
-        wd: float = 5e-4,
-        ignore_index: int | None = 255,
-    ):
+    def __init__(self, net: torch.nn.Module, task: str, num_classes: int,
+                 lr: float, wd: float, ignore_index: int = 255):
         super().__init__()
-        self.save_hyperparameters(ignore=["net"])
         self.net = net
-        self.task = task
-        # torchmetrics CE uses -100 for "no ignore"; map None -> -100 internally
-        self.ignore_index = -100 if ignore_index is None else int(ignore_index)
+        self.task = task  # "binary" or "multiclass"
         self.num_classes = int(num_classes)
+        self.lr = float(lr)
+        self.wd = float(wd)
+        self.ignore_index = int(ignore_index)
 
-        if task == "binary":
-            self.loss_bce = nn.BCEWithLogitsLoss()
-            # Foreground-only Dice over the whole epoch; we'll pass 0/1 label indices.
-            self.val_metric = DiceScore(
-                num_classes=2,
-                include_background=False,
-                average="macro",
-            )
-            self.monitor_name = "val/dice"
-        else:
+        if self.task == "multiclass":
+            # IMPORTANT: respect VOC ignore label
             self.loss_ce = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
-            # mIoU (Jaccard) over the whole epoch with ignore_index
             self.val_metric = tm.JaccardIndex(
                 task="multiclass",
                 num_classes=self.num_classes,
                 ignore_index=self.ignore_index,
                 average="macro",
             )
-            self.monitor_name = "val/miou"
+        else:
+            self.loss_bce = nn.BCEWithLogitsLoss()
+            self.val_metric = DiceScore(num_classes=2, include_background=False, average="macro")
 
-    def forward(self, x):  # type: ignore
+    def forward(self, x):
         return self.net(x)
 
-    # ----------------------------- Training -----------------------------
-    def training_step(self, batch, _):
-        x, y = batch  # y: [B,H,W] (int64)
-        logits = self(x)
-        if self.task == "binary":
-            y_f = y.float().unsqueeze(1)  # [B,1,H,W] in {0,1}
-            loss = 0.5 * self.loss_bce(logits, y_f) + 0.5 * dice_loss_with_logits(logits, y_f)
-        else:
+    def _sanitize_targets(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        Ensure labels are valid for CE; any label outside [0, C-1] is set to ignore_index.
+        This prevents CUDA device-side asserts.
+        """
+        if self.task == "multiclass":
+            if (y.min() < 0) or (y.max() >= self.num_classes):
+                y = y.clone()
+                y[(y < 0) | (y >= self.num_classes)] = self.ignore_index
+        return y
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self.net(x)
+
+        if self.task == "multiclass":
+            y = self._sanitize_targets(y)
             loss = self.loss_ce(logits, y)
+        else:
+            # y: [B,H,W] -> [B,1,H,W] float
+            loss = self.loss_bce(logits.squeeze(1), y.float())
 
-        # Step-wise logging for plots
-        self.log("train/loss", loss, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
-
-        # Log LR from first optimizer group
-        opt = self.optimizers()
-        if opt is not None:
-            opt0 = opt[0] if isinstance(opt, (list, tuple)) else opt
-            lr = opt0.param_groups[0].get("lr", None)
-            if lr is not None:
-                self.log("lr", lr, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+        # sync_dist=False avoids extra device juggling during the assert path
+        self.log("train/loss", loss, on_step=True, on_epoch=False, prog_bar=True, sync_dist=False)
         return loss
 
-    # ----------------------------- Validation -----------------------------
-    def on_validation_epoch_start(self):
-        # Ensure epoch-level accumulation
-        self.val_metric.reset()
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self.net(x)
 
-    def validation_step(self, batch, _):
-        x, y = batch  # y: [B,H,W] (int64)
-        logits = self(x)
-
-        if self.task == "binary":
-            # Threshold predictions at 0.5 → indices {0,1}
-            preds = (torch.sigmoid(logits) > 0.5).long().squeeze(1)  # [B,H,W]
-            self.val_metric.update(preds, y)
+        if self.task == "multiclass":
+            y = self._sanitize_targets(y)
+            preds = logits.argmax(dim=1)
         else:
-            # Convert to class indices and update IoU
-            preds = logits.argmax(dim=1)  # [B,H,W]
-            self.val_metric.update(preds, y)
+            preds = (torch.sigmoid(logits) > 0.5).long().squeeze(1)
+
+        self.val_metric.update(preds, y)
 
     def on_validation_epoch_end(self):
-        val_value = float(self.val_metric.compute().item())
-        if self.task == "binary":
-            self.log("val/dice", val_value, prog_bar=True, sync_dist=True)
-        else:
-            self.log("val/miou", val_value, prog_bar=True, sync_dist=True)
+        val_score = self.val_metric.compute()
+        # metric name matches your configs (val/miou for multiclass, val/dice for binary)
+        name = "val/miou" if self.task == "multiclass" else "val/dice"
+        self.log(name, val_score, prog_bar=True, sync_dist=False)
+        self.val_metric.reset()
 
-    # ----------------------------- Optimizer & LR -----------------------------
     def configure_optimizers(self):
-        opt = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.wd)
-        # Trainer may not be attached at construction; use safe fallback
-        tmax = getattr(self.trainer, "max_steps", 1000) or 1000
-        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=tmax)
-        return {"optimizer": opt, "lr_scheduler": {"scheduler": sch, "interval": "step"}}
+        opt = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.wd)
+        return opt

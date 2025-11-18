@@ -1,6 +1,6 @@
 dataset: voc
-root: data
-split_file: splits/voc/seed0_5.json
+root: data/voc
+split_file: splits/voc/seed0_100.json
 
 family: deeplabv3+
 encoder: resnet50
@@ -22,5 +22,5 @@ patience: 12
 min_delta: 0.002
 monitor: val/miou
 
-out_dir: runs/voc_deeplab
+out_dir: runs/voc_deeplab_100
 gpus: 1

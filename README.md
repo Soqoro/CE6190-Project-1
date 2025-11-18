@@ -8,13 +8,24 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
+Install datasets:
+
+1. Kvasir-SEG: It has already been downloaded and placed in `data/kvasir/`.
+2. PASCAL VOC 2012: Download from [here](https://github.com/dataset-ninja/pascal-voc-2012/blob/main/DOWNLOAD.md). Extract and place in `data/voc/`.
+3. PASCAL-Person_parts: Download from [here](http://liangchiehchen.com/projects/DeepLab.html). Extract and place in `data/parts/`.
 Prepare Datasets in the following structure:
 
 ```bash
 data/
-  voc/     {images,masks}
-  kvasir/  {images,masks}
-  parts/   {images,masks}
+  voc/     {train,test,val} / {imgs,ann}
+  kvasir/  {Annotations,ImageSets,JPEGImages,SegmentationClass}
+  parts/   {JPEGImages,pascal_person_part_gt,splits}
+```
+
+For PASCAL-VOC, run the following to create masks:
+
+```bash
+python scripts/voc_json_to_masks.py --root data/voc --neutral_as_ignore
 ```
 
 Make the dataset splits (80% train/10% val/10% test) for all datasets with 2 budgets (20%, 100%):
@@ -47,11 +58,16 @@ python -m src.engine.run --cfg configs/parts/deeplab.yaml --seed 0
 python -m src.engine.run --cfg configs/parts/segformer.yaml --seed 0
 ```
 
-Switching % labels via split_file:
+Evaluation Example:
 
 ```bash
-# Launcher picks base cfg, injects split_file + seed, and unique out_dir:
-python -m scripts.launch --ds voc --model deeplab --seed 1 --pct 10
-python -m scripts.launch --ds kvasir --model unet --seed 2 --pct 5
-python -m scripts.launch --ds parts --model segformer --seed 0 --pct 100
+python -m src.engine.eval_test --cfg configs/kvasir/unet.yaml --ckpt_policy best
 ```
+
+Qualitative Results Visualization Example:
+
+```bash
+python -m src.engine.eval_test \
+  --cfg configs/kvasir/unet.yaml --ckpt_policy best \
+  --dump_dir runs/kvasir_unet_qual --save_preds --save_gts --topk 6 --save_color --save_overlay --save_orig
+```   

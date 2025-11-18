@@ -1,10 +1,10 @@
 dataset: parts
-root: data/PASCAL-Part
-split_file: splits/parts/seed0_5.json
+root: data/parts
+split_file: splits/parts/seed0_100.json
 
 family: unet
 encoder: resnet34
-num_classes: 58  # PASCAL-Parts classes (incl. background)
+num_classes: 7  
 pretrained: true
 model_kwargs: {}
 
@@ -21,5 +21,5 @@ patience: 12
 min_delta: 0.002
 monitor: val/miou
 
-out_dir: runs/parts_unet
+out_dir: runs/parts_unet_100
 gpus: 1

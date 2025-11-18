@@ -1,10 +1,10 @@
 dataset: parts
-root: data/PASCAL-Part
-split_file: splits/parts/seed0_5.json
+root: data/parts
+split_file: splits/parts/seed0_100.json
 
 family: deeplabv3+
 encoder: resnet50
-num_classes: 58
+num_classes: 7
 pretrained: true
 model_kwargs:
   encoder_output_stride: 16
@@ -22,5 +22,5 @@ patience: 12
 min_delta: 0.002
 monitor: val/miou
 
-out_dir: runs/parts_deeplab
+out_dir: runs/parts_deeplab_100
 gpus: 1

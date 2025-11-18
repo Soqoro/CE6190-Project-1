@@ -1,6 +1,6 @@
 dataset: kvasir
 root: data/kvasir
-split_file: splits/kvasir/seed0_20.json  # change to seedX_Y.json as needed
+split_file: splits/kvasir/seed0_100.json  # change to seedX_Y.json as needed
 
 family: unet
 encoder: resnet34
@@ -21,5 +21,5 @@ patience: 10
 min_delta: 0.001
 # monitor auto-set: val/dice for binary
 
-out_dir: runs/kvasir_unet # Change when split_file is changed
+out_dir: runs/kvasir_unet_100 # Change when split_file is changed
 gpus: 1
